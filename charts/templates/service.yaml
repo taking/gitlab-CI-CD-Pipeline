@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "test-samplePythonFlask.fullname" . }}
+  labels:
+    app: {{ template "test-samplePythonFlask.name" . }}
+    chart: {{ template "test-samplePythonFlask.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: {{ template "test-samplePythonFlask.name" . }}
+    release: {{ .Release.Name }}

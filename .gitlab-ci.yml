@@ -1,0 +1,194 @@
+# 공통 variables 설정
+variables:
+  # Services
+  SERVICE_NAME: $CI_PROJECT_NAME                      # 수정 X
+  SERVICE_PORT: 8080                                  # 해당 부분 수정 필요합니다.
+  SERVICE_NAMESPACE: $CI_PROJECT_NAMESPACE            # 수정 X
+  TAG: $CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA       # 수정 X
+  # Registry
+  REGISTRY_URL: registry.smart-ocean.cf               # 수정 X
+  REGISTRY_PROJECT: library                           # 경우에 따라 수정
+  REGISTRY_ADDRESS: $REGISTRY_URL/$REGISTRY_PROJECT   # 수정 X
+  REGISTRY_USER: harbor_free                          # 수정 X
+  REGISTRY_PASS: sTP49n59QgcGSqC                      # 수정 X
+  # ARGOCD
+  _URL: https://git.smart-ocean.cf/$CI_PROJECT_NAMESPACE/$CI_PROJECT_NAME.git
+  ACCESS_TOKEN: 입력필요
+
+# CI 순서 설정
+stages:
+  - test
+  - docker-build
+  - docker-deploy
+  - kubernetes-deploy
+  #- helm
+
+
+# test environment 설정
+.test-environment:
+  image: python:3.6
+  before_script:  
+    - pip install -r requirements.txt
+    - pip install flake8 pytest pylint
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      # when: never
+  #   - if: '$CI_COMMIT_TAG || $CI_COMMIT_BRANCH'
+
+
+# 공통 environment 설정
+.docker-environment:
+  image: docker:stable
+  services:
+    - name: docker:stable-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+  after_script:
+    - docker image prune -af
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    # - if: '$CI_COMMIT_BRANCH == "main"'
+      exists:
+        - Dockerfile
+
+
+.gitlab-registry.environment:
+  extends: .docker-environment
+  before_script:  
+    - echo $CI_REGISTRY_IMAGE:$TAG $PWD
+    - echo $CI_JOB_TOKEN | docker login -u $CI_REGISTRY_USER $CI_REGISTRY --password-stdin
+        
+
+.harbor-registry-environment:
+  extends: .docker-environment
+  before_script:  
+    - echo -n $REGISTRY_PASS | docker login $REGISTRY_ADDRESS -u $REGISTRY_USER --password-stdin
+
+.helm-environment:
+  image: alpine/helm
+  before_script:
+    - helm plugin install https://github.com/chartmuseum/helm-push.git
+    - mkdir -p /root/.config/helm/
+    - touch /root/.config/helm/repositories.yaml
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      # when: never
+  #   - if: '$CI_COMMIT_TAG || $CI_COMMIT_BRANCH'
+
+
+# Test
+###########################################
+Test:
+  extends: .test-environment
+  stage: test
+  script:
+    - python test.py test
+    - pytest test.py
+    - pylint -d C0301 *.py  --disable=missing-docstring
+    - flake8 --max-line-length=120 *.py
+
+
+# Docker
+###########################################
+Docker-Build:
+  extends: .gitlab-registry.environment
+  stage: docker-build
+  script:
+    - cat Dockerfile
+    - docker pull $CI_REGISTRY_IMAGE:latest || true
+    - >
+      docker build --network host --cache-from $CI_REGISTRY_IMAGE:latest --tag $CI_REGISTRY_IMAGE:$TAG .
+    - echo "t - $CI_REGISTRY_IMAGE:$TAG\n"
+    - docker push "$CI_REGISTRY_IMAGE:$TAG"
+
+
+gitlab-registry:
+  extends: .gitlab-registry.environment
+  stage: docker-deploy
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$TAG
+    - docker tag $CI_REGISTRY_IMAGE:$TAG $CI_REGISTRY_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE:latest
+
+harbor-registry:
+  extends: .harbor-registry-environment
+  stage: docker-deploy
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:$TAG
+    - docker tag $CI_REGISTRY_IMAGE:$TAG $REGISTRY_ADDRESS/$CI_PROJECT_NAME:latest
+    - docker tag $CI_REGISTRY_IMAGE:$TAG $REGISTRY_ADDRESS/$CI_PROJECT_NAME:$TAG
+    - docker push $REGISTRY_ADDRESS/$CI_PROJECT_NAME:latest
+    - docker push $REGISTRY_ADDRESS/$CI_PROJECT_NAME:$TAG
+
+# Helm
+###########################################
+# helm-build-deployment:
+#   extends: .helm-environment
+#   stage: helm
+#   script:
+#     - helm package charts/
+#     - helm cm-push charts/ -u=$REGISTRY_USER -p=$REGISTRY_PASS $REGISTRY_ADDRESS/$CI_PROJECT_NAME:latest
+#     - echo "$REGISTRY_ADDRESS/$CI_PROJECT_NAME:latest"
+
+kubernetes-deploy:
+  image: bitnami/kubectl:latest
+  stage: kubernetes-deploy
+  script:
+    - echo $KUBE_CONFIG |base64 -d > /.kube/config
+    - |
+      cat <<EOF | kubectl apply -f -
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: $SERVICE_NAMESPACE
+      EOF
+    - |
+      kubectl create secret docker-registry regcred --dry-run=client -n $SERVICE_NAMESPACE \
+        --docker-server=$CI_REGISTRY \
+        --docker-username=$CI_REGISTRY_USER \
+        --docker-password=$CI_JOB_TOKEN -o yaml > docker-secret.yaml
+    - kubectl apply -f docker-secret.yaml
+    - |
+      cat <<EOF | kubectl apply -f -
+      apiVersion: serving.knative.dev/v1 # Current version of Knative
+      kind: Service
+      metadata:
+        name: $SERVICE_NAME-$TAG # The name of the app
+        namespace: $SERVICE_NAMESPACE # The namespace the app will use
+      spec:
+        template:
+          spec:
+            containers:
+              - image: $REGISTRY_ADDRESS/$CI_PROJECT_NAME:$TAG
+                ports:
+                  - containerPort: $SERVICE_PORT
+            imagePullSecrets:
+            - name: regcred
+      EOF
+    - sleep 3
+    - echo $(kubectl get ksvc/$SERVICE_NAME-$TAG -n $SERVICE_NAMESPACE -o=jsonpath='{.status.url}')
+
+kubernetes-deploy:
+  image: alpine/curl:latest
+  stage: kubernetes-deploy
+  script:
+    - echo -n "-----started-----"
+    - |
+      VERSION=$(curl --silent "https://api.github.com/repos/argoproj/argo-cd/releases/latest" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/') && \
+      wget -O argocd https://github.com/argoproj/argo-cd/releases/download/$VERSION/argocd-linux-amd64 && \
+      chmod a+x ./argocd
+    - ./argocd login argocd.smart-ocean.cf --username $ARGOUSER --password $ARGOPASS --grpc-web --insecure
+    - ./argocd repo add $_URL --username $GITLAB_USER_NAME --password $ACCESS_TOKEN --upsert
+    - |
+      ./argocd app create $CI_PROJECT_NAME-$TAG \
+        --repo $_URL \
+        --revision $CI_COMMIT_REF_NAME \
+        --path deploy \
+        --dest-server https://kubernetes.default.svc \
+        --dest-namespace $CI_PROJECT_NAMESPACE \
+        --sync-policy automated

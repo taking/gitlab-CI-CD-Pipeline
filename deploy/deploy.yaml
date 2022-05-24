@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cicd-example-deployment
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: cicd-example
+  template:
+    metadata:
+      labels:
+        app: cicd-example
+    spec:
+      containers:
+      - image: registry.smart-ocean.cf/library/cicd-example:latest
+        name: cicd-example
+        ports:
+        - containerPort: 80
