@@ -173,7 +173,7 @@ kubernetes-deploy:
     - sleep 3
     - echo $(kubectl get ksvc/$SERVICE_NAME-$TAG -n $SERVICE_NAMESPACE -o=jsonpath='{.status.url}')
 
-kubernetes-deploy:
+argocd:
   image: alpine/curl:latest
   stage: kubernetes-deploy
   script:
